@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Vidhya Service - Core Stack (IAM, ECR, CloudWatch Logs, artifact storage).
+
+  Deploy this stack ONCE per environment (dev, prod) before deploying
+  aws.cfn.app.yml. It creates the account-level plumbing the app stack
+  depends on: the ECS task execution/runtime IAM roles, the ECR repository
+  for container images, the CloudWatch log group, and an S3 bucket for
+  build/deploy artifacts.
+
+  This template is intentionally self-contained - it has no dependency on
+  any pre-existing shared "platform" stacks, so it can be deployed as-is in
+  a brand-new AWS account.
+
+Parameters:
+  ServiceName:
+    Type: String
+    Description: Base name used to namespace all resources and IAM scopes.
+    Default: vidhya-service
+
+  Environment:
+    Type: String
+    Description: Deployment environment. Phase 1 only supports dev and prod.
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+
+  AppImageName:
+    Type: String
+    Default: app
+
+  EcrLifecyclePolicy:
+    Type: String
+    Default: '{"rules":[{"rulePriority":1,"description":"Expire untagged images after 1 image","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":1},"action":{"type":"expire"}}]}'
+
+  CreateDeployerUser:
+    Type: String
+    Description: >
+      Whether to create an IAM user + access key for CI/CD deploys. Set to
+      "false" if you'd rather assume an existing role from your CI provider
+      (e.g. GitHub Actions OIDC) instead of long-lived access keys.
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+
+Conditions:
+  ShouldCreateDeployerUser: !Equals [!Ref CreateDeployerUser, "true"]
+
+Resources:
+  # ------------------------------------------------------ access: deployment ---
+  # Minimal permissions needed by a CI/CD pipeline to push images and update
+  # the ECS service for this specific service+environment. Scoped by
+  # ServiceName-Environment so multiple environments/services can coexist
+  # safely in the same AWS account.
+
+  DeploymentIamManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ServiceName}-${Environment}-deploy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:Describe*
+              - cloudformation:Get*
+              - cloudformation:List*
+              - cloudformation:CreateChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:ValidateTemplate
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:CompleteLayerUpload
+              - ecr:GetDownloadUrlForLayer
+              - ecr:InitiateLayerUpload
+              - ecr:PutImage
+              - ecr:UploadLayerPart
+            Resource:
+              - !Sub arn:aws:ecr:*:${AWS::AccountId}:repository/${ServiceName}-${Environment}-*
+          - Effect: Allow
+            Action:
+              - ecs:DescribeServices
+              - ecs:DescribeTaskDefinition
+              - ecs:RegisterTaskDefinition
+              - ecs:UpdateService
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/${ServiceName}-${Environment}-*
+
+  DeployerIamUser:
+    Type: AWS::IAM::User
+    Condition: ShouldCreateDeployerUser
+    Properties:
+      UserName: !Sub ${ServiceName}-${Environment}-deployer
+      ManagedPolicyArns:
+        - !Ref DeploymentIamManagedPolicy
+
+  # --------------------------------------------------------- access: service ---
+
+  # ECS task EXECUTION role: what the ECS agent itself needs to pull the
+  # image and ship logs/secrets into the container at startup.
+  ExecutionIamManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ServiceName}-${Environment}-execution
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+            Resource:
+              - !Sub arn:aws:ecr:*:${AWS::AccountId}:repository/${ServiceName}-${Environment}-*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ServiceName}-${Environment}-*:log-stream:*
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ServiceName}-${Environment}-*
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}-${Environment}-*
+
+  ExecutionIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-${Environment}-execution
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref ExecutionIamManagedPolicy
+
+  # Application (task) role: what the Go binary itself is allowed to do at
+  # runtime. Kept minimal for phase 1 (Postgres only) - the Secrets
+  # Manager/SSM/SQS/SNS statements below are ready for phase 2 (Redis/Kafka
+  # credentials, async notifications) without needing a template change.
+  TaskIamManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ServiceName}-${Environment}-task
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ServiceName}-${Environment}-*
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceName}-${Environment}-*
+          - Effect: Allow
+            # Reserved for phase 2 async messaging (e.g. attendance/exam
+            # event notifications). Harmless if unused.
+            Action:
+              - sqs:GetQueueUrl
+              - sqs:GetQueueAttributes
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+            Resource:
+              - !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ServiceName}-${Environment}-*
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ServiceName}-${Environment}-*
+
+  TaskIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ServiceName}-${Environment}-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref TaskIamManagedPolicy
+
+  # -------------------------------------------------------------- namespaces ---
+
+  ArtifactsS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ServiceName}-${Environment}-artifacts-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: infrequent-access
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+
+  AppEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ServiceName}-${Environment}-${AppImageName}
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: !Ref EcrLifecyclePolicy
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${ServiceName}-${Environment}
+      RetentionInDays: 30
+
+  # ------------------------------------------------------ parameters: access ---
+  # Consumed by aws.cfn.app.yml so the two stacks can be deployed
+  # independently without manual copy/paste of ARNs.
+
+  ParameterExecutionIamRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}-core/resources/iam/role/execution/arn
+      Type: String
+      Value: !GetAtt ExecutionIamRole.Arn
+
+  ParameterTaskIamRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}-core/resources/iam/role/task/arn
+      Type: String
+      Value: !GetAtt TaskIamRole.Arn
+
+  ParameterAppEcrRepoUri:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}-core/resources/ecr/repository/${AppImageName}/uri
+      Type: String
+      Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppEcrRepo}
+
+  ParameterAppLogGroupName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}-core/resources/logs/log-group/${AppImageName}/name
+      Type: String
+      Value: !Ref AppLogGroup
+
+  ParameterArtifactsS3BucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}-core/resources/s3/bucket/artifacts/name
+      Type: String
+      Value: !Ref ArtifactsS3Bucket
+
+Outputs:
+  # Exported (not just plain Outputs) so aws.cfn.app.yml can pull these in
+  # with Fn::ImportValue instead of a manual copy/paste step between stacks.
+  ExecutionIamRoleArn:
+    Value: !GetAtt ExecutionIamRole.Arn
+    Export:
+      Name: !Sub ${ServiceName}-${Environment}-core-ExecutionIamRoleArn
+  TaskIamRoleArn:
+    Value: !GetAtt TaskIamRole.Arn
+    Export:
+      Name: !Sub ${ServiceName}-${Environment}-core-TaskIamRoleArn
+  AppEcrRepoUri:
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppEcrRepo}
+    Export:
+      Name: !Sub ${ServiceName}-${Environment}-core-AppEcrRepoUri
+  AppLogGroupName:
+    Value: !Ref AppLogGroup
+    Export:
+      Name: !Sub ${ServiceName}-${Environment}-core-AppLogGroupName
+  ArtifactsS3BucketName:
+    Value: !Ref ArtifactsS3Bucket
+    Export:
+      Name: !Sub ${ServiceName}-${Environment}-core-ArtifactsS3BucketName

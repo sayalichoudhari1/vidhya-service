@@ -1,0 +1,630 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  Vidhya Service - App Stack (network, data, cache, messaging, compute).
+
+  Self-contained: creates its own VPC/subnets, so it can be deployed in a
+  brand-new AWS account without depending on any other pre-existing
+  "platform" stack. Deploy aws.cfn.core.yml first (same ServiceName +
+  Environment) - this stack reads the IAM role / ECR repo / log group it
+  created via SSM parameters.
+
+  Phase 1 only needs the Aurora PostgreSQL resources below; Redis (Elasti
+  Cache) and Kafka (MSK) are provisioned as skeletons for phase 2 and are
+  OFF by default (EnableRedis/EnableKafka) so a fresh deploy doesn't incur
+  their cost until you actually need them - flip the parameter and update
+  the stack when you do, no template changes required.
+
+Parameters:
+  # -------------------------------------------------------------- meta ---
+  ServiceName:
+    Type: String
+    Default: vidhya-service
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Default: dev
+
+  # ----------------------------------------------------------- network ---
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.42.0.0/24
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.42.1.0/24
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.42.10.0/24
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.42.11.0/24
+  EnableNatGateway:
+    Type: String
+    Description: >
+      NAT Gateway lets the ECS tasks in private subnets pull images and
+      reach the internet. Costs ~$0.045/hr + data. Set to "false" only if
+      you add VPC endpoints for ECR/Secrets Manager/CloudWatch Logs instead.
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  # ------------------------------------------------------------ access ---
+  AllowedIngressCidr:
+    Type: String
+    Description: CIDR allowed to reach the public load balancer.
+    Default: 0.0.0.0/0
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for HTTPS. Leave blank to serve HTTP only (fine for dev).
+    Default: ""
+
+  # ----------------------------------------------------------- compute ---
+  ContainerImageTag:
+    Type: String
+    Default: latest
+  ContainerPort:
+    Type: Number
+    Default: 8080
+  ContainerCpu:
+    Type: String
+    Default: "256"
+  ContainerMemory:
+    Type: String
+    Default: "512"
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+  # ------------------------------------------------------- app config ---
+  AppUrlPrefix:
+    Type: String
+    Default: /vidhyaservice
+  JwtIssuer:
+    Type: String
+    Default: vidhya-service
+  JwtAccessTokenDuration:
+    Type: String
+    Default: 2h
+  LogLevel:
+    Type: String
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Default: INFO
+  LogFormat:
+    Type: String
+    AllowedValues: [TEXT, JSON]
+    Default: JSON
+  SeedAdminEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  SeedAdminEmail:
+    Type: String
+    Default: admin@vidhya.local
+
+  # -------------------------------------------------------------- data ---
+  DbName:
+    Type: String
+    Default: vidhyadb
+  DbEngineVersion:
+    Type: String
+    Default: "16.4"
+  DbMinCapacityAcu:
+    Type: Number
+    Description: Aurora Serverless v2 minimum capacity (ACUs). 0.5 is the smallest.
+    Default: 0.5
+  DbMaxCapacityAcu:
+    Type: Number
+    Default: 2
+
+  # ------------------------------------------------------------- redis ---
+  EnableRedis:
+    Type: String
+    Description: Provision ElastiCache Redis. Not used by the app yet (REDIS_ENABLED stays false) - phase 2 toggle.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.micro
+
+  # ------------------------------------------------------------- kafka ---
+  EnableKafka:
+    Type: String
+    Description: Provision MSK (Kafka). Not used by the app yet (KAFKA_ENABLED stays false) - phase 2 toggle.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+  KafkaInstanceType:
+    Type: String
+    Default: kafka.t3.small
+  KafkaVersion:
+    Type: String
+    Default: 3.6.0
+
+  # ----------------------------------- future external service placeholders
+  # Vidhya is expected to grow beyond a single service. These two
+  # placeholders reserve the plumbing (env vars + SSM parameters) for the
+  # first external integrations, without committing to what they actually
+  # do yet. Wire real values in when those services exist; no template
+  # change needed on this end.
+  MatiServiceBaseUrl:
+    Type: String
+    Description: Placeholder base URL for the future "mati-service" integration (e.g. notifications/comms). Leave blank until it exists.
+    Default: ""
+  GatiServiceBaseUrl:
+    Type: String
+    Description: Placeholder base URL for the future "gati-service" integration (e.g. transport/logistics). Leave blank until it exists.
+    Default: ""
+
+Conditions:
+  ShouldCreateNatGateway: !Equals [!Ref EnableNatGateway, "true"]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  ShouldEnableRedis: !Equals [!Ref EnableRedis, "true"]
+  ShouldEnableKafka: !Equals [!Ref EnableKafka, "true"]
+  HasMatiServiceBaseUrl: !Not [!Equals [!Ref MatiServiceBaseUrl, ""]]
+  HasGatiServiceBaseUrl: !Not [!Equals [!Ref GatiServiceBaseUrl, ""]]
+
+Resources:
+  # =============================================================== network ===
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-${Environment}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-${Environment}-public-1
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-${Environment}-public-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-${Environment}-private-1
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ServiceName}-${Environment}-private-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: ShouldCreateNatGateway
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: ShouldCreateNatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PrivateRouteToNat:
+    Type: AWS::EC2::Route
+    Condition: ShouldCreateNatGateway
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================ security ===
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ServiceName}-${Environment} ALB ingress
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedIngressCidr
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedIngressCidr
+
+  EcsServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ServiceName}-${Environment} ECS service ingress from ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ServiceName}-${Environment} Aurora ingress from ECS
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldEnableRedis
+    Properties:
+      GroupDescription: !Sub ${ServiceName}-${Environment} Redis ingress from ECS
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+
+  MskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldEnableKafka
+    Properties:
+      GroupDescription: !Sub ${ServiceName}-${Environment} MSK ingress from ECS
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 9094
+          ToPort: 9094
+          SourceSecurityGroupId: !Ref EcsServiceSecurityGroup
+
+  # ================================================================ data ===
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${ServiceName}-${Environment} Aurora subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # ManageMasterUserPassword generates + rotates the master credential in
+  # Secrets Manager for us - no password parameter to leak in stack events.
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: !Ref DbEngineVersion
+      DatabaseName: !Ref DbName
+      MasterUsername: appuser
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DbSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref DbMinCapacityAcu
+        MaxCapacity: !Ref DbMaxCapacityAcu
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref DbCluster
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      PubliclyAccessible: false
+
+  # =============================================================== redis ===
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Condition: ShouldEnableRedis
+    Properties:
+      Description: !Sub ${ServiceName}-${Environment} Redis subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: ShouldEnableRedis
+    Properties:
+      ReplicationGroupDescription: !Sub ${ServiceName}-${Environment} Redis
+      Engine: redis
+      CacheNodeType: !Ref RedisNodeType
+      NumCacheClusters: 1
+      AutomaticFailoverEnabled: false
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+
+  # =============================================================== kafka ===
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Condition: ShouldEnableKafka
+    Properties:
+      ClusterName: !Sub ${ServiceName}-${Environment}
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: 2
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref KafkaInstanceType
+        ClientSubnets:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroups:
+          - !Ref MskSecurityGroup
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+
+  # ============================================================= compute ===
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ServiceName}-${Environment}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ServiceName}-${Environment}
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ServiceName}-${Environment}
+      TargetType: ip
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      VpcId: !Ref Vpc
+      HealthCheckPath: !Sub ${AppUrlPrefix}/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ServiceName}-${Environment}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: ${ServiceName}-${Environment}-core-ExecutionIamRoleArn
+      TaskRoleArn: !ImportValue
+        Fn::Sub: ${ServiceName}-${Environment}-core-TaskIamRoleArn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - "${RepoUri}:${ContainerImageTag}"
+            - RepoUri:
+                Fn::ImportValue: !Sub ${ServiceName}-${Environment}-core-AppEcrRepoUri
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          Environment:
+            - Name: APP_SERVER_ADDRESS
+              Value: !Sub ":${ContainerPort}"
+            - Name: APP_SERVER_URL_PREFIX
+              Value: !Ref AppUrlPrefix
+            - Name: DB_HOST
+              Value: !GetAtt DbCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt DbCluster.Endpoint.Port
+            - Name: DB_NAME
+              Value: !Ref DbName
+            - Name: DB_SSLMODE
+              Value: require
+            - Name: JWT_ISSUER
+              Value: !Ref JwtIssuer
+            - Name: JWT_ACCESS_TOKEN_DURATION
+              Value: !Ref JwtAccessTokenDuration
+            - Name: LOG_LEVEL
+              Value: !Ref LogLevel
+            - Name: LOG_FORMAT
+              Value: !Ref LogFormat
+            - Name: SEED_ADMIN_ENABLED
+              Value: !Ref SeedAdminEnabled
+            - Name: SEED_ADMIN_EMAIL
+              Value: !Ref SeedAdminEmail
+            - Name: REDIS_ENABLED
+              Value: "false" # flip once phase 2 wiring in src/cache actually uses it
+            - Name: KAFKA_ENABLED
+              Value: "false" # flip once phase 2 wiring in src/messaging actually uses it
+            # Placeholders for future service-to-service integrations - not
+            # consumed by the app yet, wired here so the task definition
+            # doesn't need to change when they come online.
+            - Name: APP_MATI_SERVICE_URL
+              Value: !Ref MatiServiceBaseUrl
+            - Name: APP_GATI_SERVICE_URL
+              Value: !Ref GatiServiceBaseUrl
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub "${DbCluster.MasterUserSecret.SecretArn}:username::"
+            - Name: DB_PASS
+              ValueFrom: !Sub "${DbCluster.MasterUserSecret.SecretArn}:password::"
+            - Name: JWT_SECRET
+              ValueFrom: !Ref JwtSecretsManagerSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: ${ServiceName}-${Environment}-core-AppLogGroupName
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  # Kept separate from the Aurora-managed master secret so JWT_SECRET can be
+  # rotated independently of database credentials.
+  JwtSecretsManagerSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ServiceName}-${Environment}-jwt-secret
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub ${ServiceName}-${Environment}
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref EcsServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+  # ------------------------------------------- future integration parameters
+  # Mirrors the *ServiceBaseUrl parameters into SSM so other tooling
+  # (deploy scripts, other stacks) can read them without re-deploying this
+  # stack, once mati-service / gati-service actually exist.
+  ParameterMatiServiceBaseUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}/integrations/mati-service/base-url
+      Type: String
+      Value: !If [HasMatiServiceBaseUrl, !Ref MatiServiceBaseUrl, "unset"]
+
+  ParameterGatiServiceBaseUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ServiceName}-${Environment}/integrations/gati-service/base-url
+      Type: String
+      Value: !If [HasGatiServiceBaseUrl, !Ref GatiServiceBaseUrl, "unset"]
+
+Outputs:
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  DbClusterEndpoint:
+    Value: !GetAtt DbCluster.Endpoint.Address
+  DbMasterSecretArn:
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+  RedisPrimaryEndpoint:
+    Condition: ShouldEnableRedis
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+  MskBootstrapBrokers:
+    Condition: ShouldEnableKafka
+    Value: !GetAtt MskCluster.Arn

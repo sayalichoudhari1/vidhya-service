@@ -1,0 +1,98 @@
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  vidhya_postgres_data:
+  vidhya_redis_data:
+  vidhya_kafka_data:
+
+services:
+  postgres:
+    image: local/vidhya-postgres:dev
+    container_name: vidhya_postgres
+    build:
+      context: ./postgres
+    networks:
+      - internal
+    restart: "unless-stopped"
+    ports:
+      - "55432:5432"
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${DB_NAME:-vidhyadb}
+      POSTGRES_USER: ${DB_MASTER_USER:-appuser}
+      POSTGRES_PASSWORD: ${DB_MASTER_PASS:-appuser}
+    volumes:
+      - ../../sql:/mnt/artifacts
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/init.sh
+      - vidhya_postgres_data:/var/lib/postgresql:delegated
+    # Host port is remapped (not the default 5432) to avoid clashing with
+    # another Postgres container you may already have running locally.
+    # Matches DB_PORT in the repo-root .env.example.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Applies the Liquibase changelogs in ../../sql/changelogs on every start.
+  # Run once with `make migrate` (or docker-compose up liquibase) after the
+  # postgres container is healthy; it exits after applying migrations.
+  liquibase:
+    image: local/vidhya-liquibase:dev
+    container_name: vidhya_liquibase
+    networks:
+      - internal
+    build:
+      context: ./liquibase
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../../sql:/mnt/artifacts
+      - ./liquibase/init-scripts/:/dbtool/scripts/
+
+  redis:
+    build:
+      context: ./redis
+    container_name: vidhya_redis
+    networks:
+      - internal
+    restart: "unless-stopped"
+    ports:
+      - "63790:6379"
+    volumes:
+      - vidhya_redis_data:/data
+
+  # Kafka is OPTIONAL and disabled by default for phase 1 (the service runs
+  # fully on Postgres alone; see src/config and src/messaging). Bring it up
+  # explicitly with `docker-compose --profile kafka up -d kafka` if/when you
+  # want to exercise KAFKA_ENABLED=true locally.
+  kafka:
+    image: landoop/fast-data-dev:1.1.1
+    container_name: vidhya_kafka
+    profiles: ["kafka"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 3584M
+        reservations:
+          memory: 100M
+    restart: "unless-stopped"
+    ports:
+      - "12181:2181" # Zookeeper
+      - "19092:9092" # Kafka
+      - "13030:3030" # Kafka UI
+      - "18082:8082" # Kafka REST Proxy
+    environment:
+      - ADV_HOST=127.0.0.1
+      - SAMPLEDATA=0
+      - RUNNING_SAMPLEDATA=0
+      - RUNTESTS=0
+    volumes:
+      - vidhya_kafka_data:/kafka-zookeeper:delegated
+    networks:
+      - internal
